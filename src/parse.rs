@@ -1,11 +1,3 @@
-use nom::{
-    branch::alt,
-    bytes::complete::take_while1,
-    character::complete::{char, one_of},
-    sequence::{delimited, preceded, tuple},
-    IResult, Parser,
-};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     And,
@@ -22,69 +14,151 @@ pub enum Expression<'a> {
     Binary(BinaryOp, Box<Expression<'a>>, Box<Expression<'a>>),
 }
 
+// --- Combinators ---
+fn satisfies<P>(p: P) -> impl Fn(&str) -> Option<(&str, char)>  
+where P: Fn(char) -> bool 
+{
+    move |s| {
+        let char = s.chars().next()?;
+
+        if p(char) {
+            Some((&s[1..], char))
+        } else {
+            None
+        }
+    }
+}
+
+fn char(c: char) -> impl Fn(&str) -> Option<(&str, char)> {
+    satisfies(move |x| x == c)
+}
+
+fn take_while1<P>(p: P) -> impl Fn(&str) -> Option<(&str, &str)> 
+where P: Fn(char) -> bool {
+    move |s| {
+        let mut chars = s.char_indices();
+        if !p(chars.next()?.1) {
+            return None
+        }
+
+        let mut index = 1;
+
+        for (i, c) in s.char_indices() {
+            if !p(c) {
+                break;
+            }
+
+            index = i + c.len_utf8();
+        }
+
+        Some((&s[index..], &s[..index]))
+    }
+}
+
+fn delimited<'a, D1, P, D2, O1, O, O2>(d1: D1, parser: P, d2: D2) -> impl Fn(&'a str) -> Option<(&'a str, O)> 
+where D1: Fn(&'a str) -> Option<(&'a str, O1)>,
+      D2: Fn(&'a str) -> Option<(&'a str, O2)>,
+      P: Fn(&'a str) -> Option<(&'a str, O)>
+{
+    move |s| {
+        let (rest, _) = d1(s)?;
+        let (rest, output) = parser(rest)?;
+        let (rest, _) = d2(rest)?;
+
+        Some((rest, output))
+    }
+}
+
+fn preceded<'a, D, P, O1, O>(d: D, parser: P) -> impl Fn(&'a str) -> Option<(&'a str, O)> 
+where D: Fn(&'a str) -> Option<(&'a str, O1)>,
+      P: Fn(&'a str) -> Option<(&'a str, O)>
+{
+    move |s| {
+        let (rest, _) = d(s)?;
+
+        parser(rest)
+    }
+}
+
+fn thruple<'a, P1, P2, P3, O1, O2, O3>(p1: P1, p2: P2, p3: P3) -> impl Fn(&'a str) -> Option<(&'a str, (O1, O2, O3))>
+where P1: Fn(&'a str) -> Option<(&'a str, O1)>,
+      P2: Fn(&'a str) -> Option<(&'a str, O2)>,
+      P3: Fn(&'a str) -> Option<(&'a str, O3)>,
+{
+    move |s| {
+        let (rest, o1) = p1(s)?;
+        let (rest, o2) = p2(rest)?;
+        let (rest, o3) = p3(rest)?;
+
+        Some((rest, (o1, o2, o3)))
+    }
+}
+
 // --- Basic Primitives and Predicates ---
 
+
+
 // Parses a constant ("0" or "1")
-fn constant(s: &str) -> IResult<&str, Expression> {
-    one_of("01")
-        .map(|c| match c {
-            '0' => Expression::Constant(false),
-            '1' => Expression::Constant(true),
-            _ => unreachable!(),
-        })
-        .parse(s)
+fn constant(s: &str) -> Option<(&str, Expression)> {
+    let (rest, c) = satisfies(|c| c == '0' || c == '1')(s)?;
+
+    let b = Expression::Constant(match c {
+        '0' => false,
+        '1' => true,
+        _ => unreachable!(),
+    });
+
+    Some((rest, b))
 }
 
 // Parses a logical variable, which is a string of 1 or more alphabetical characters.
-fn variable(s: &str) -> IResult<&str, Expression> {
-    take_while1(|c: char| c.is_ascii_alphabetic())
-        .map(Expression::Variable)
-        .parse(s)
+fn variable(s: &str) -> Option<(&str, Expression)> {
+    take_while1(|c: char| c.is_ascii_alphabetic())(s)
+        .map(|(rest, out)| (rest, Expression::Variable(out)))
 }
 
 // Parses an infix binary operator ("&", "|" or "^").
-fn binary_op(s: &str) -> IResult<&str, BinaryOp> {
-    one_of("&|^")
-        .map(|c| match c {
-            '&' => BinaryOp::And,
-            '|' => BinaryOp::Or,
-            '^' => BinaryOp::Xor,
-            _ => unreachable!(),
-        })
-        .parse(s)
+fn binary_op(s: &str) -> Option<(&str, BinaryOp)> {
+    satisfies(|c| "&|^".contains(c))(s)
+        .map(|(rest, c)| 
+            (rest, match c {
+                '&' => BinaryOp::And,
+                '|' => BinaryOp::Or,
+                '^' => BinaryOp::Xor,
+                _ => unreachable!(),
+        }))
 }
 
 // From this point on i test out my grammar.
 // god help us
 
 // value ::= constant | variable
-fn value(s: &str) -> IResult<&str, Expression> {
-    alt((constant, variable))(s)
+fn value(s: &str) -> Option<(&str, Expression)> {
+    constant(s).or(variable(s))
 }
 
 // This isn't really an "atom". It's just the only word i can think of for it.
 // Either a value or a bracketed expression.
 
 // atom ::= value | '(' expression ')'
-fn atom(s: &str) -> IResult<&str, Expression> {
-    alt((value, delimited(char('('), expression, char(')'))))(s)
+fn atom(s: &str) -> Option<(&str, Expression)> {
+    value(s).or(delimited(char('('), expression, char(')'))(s))
 }
 
-fn negated_atom(s: &str) -> IResult<&str, Expression> {
-    preceded(char('~'), atom)
-        .map(|expr| Expression::Not(Box::new(expr)))
-        .parse(s)
+fn negated_atom(s: &str) -> Option<(&str, Expression)> {
+    let (rest, output) = preceded(char('~'), atom)(s)?;
+
+    Some((rest, Expression::Not(Box::new(output))))
 }
 
 // term ::= '~' atom | atom
-fn term(s: &str) -> IResult<&str, Expression> {
-    alt((negated_atom, atom))(s)
+fn term(s: &str) -> Option<(&str, Expression)> {
+    negated_atom(s).or(atom(s))
 }
 
-fn combination(s: &str) -> IResult<&str, Expression> {
-    tuple((term, binary_op, expression))
-        .map(|(t, bop, expr)| Expression::Binary(bop, Box::new(t), Box::new(expr)))
-        .parse(s)
+fn combination(s: &str) -> Option<(&str, Expression)> {
+    let (rest, (t, bop, expr)) = thruple(term, binary_op, expression)(s)?;
+    Some((rest, Expression::Binary(bop, Box::new(t), Box::new(expr))))
 }
 
 // expression ::= term binary_op expression | term
@@ -94,8 +168,8 @@ fn combination(s: &str) -> IResult<&str, Expression> {
 /// spec for the problem says all intermediate steps should be bracketed
 /// However for a real logical expression parser, & would have to have higher
 /// precedence than |. It currently has the same.
-pub fn expression(s: &str) -> IResult<&str, Expression> {
-    alt((combination, term))(s)
+pub fn expression(s: &str) -> Option<(&str, Expression)> {
+    combination(s).or(term(s))
 }
 
 // --- Unit Tests ---
@@ -106,9 +180,9 @@ mod test {
 
     #[test]
     fn test_value() {
-        assert_eq!(value("xyz1|&"), Ok(("1|&", Expression::Variable("xyz"))));
-        assert_eq!(value("101010"), Ok(("01010", Expression::Constant(true))));
-        assert!(value("&|()^^^hello111").is_err());
+        assert_eq!(value("xyz1|&"), Some(("1|&", Expression::Variable("xyz"))));
+        assert_eq!(value("101010"), Some(("01010", Expression::Constant(true))));
+        assert!(value("&|()^^^hello111").is_none());
     }
 
     #[test]
@@ -135,23 +209,23 @@ mod test {
             )),
         );
         // Simple values
-        assert_eq!(expression("xyz"), Ok(("", xyz.clone())));
-        assert_eq!(expression("1"), Ok(("", fr.clone())));
+        assert_eq!(expression("xyz"), Some(("", xyz.clone())));
+        assert_eq!(expression("1"), Some(("", fr.clone())));
 
         // Negation
         assert_eq!(
             expression("~xyz"),
-            Ok(("", Expression::Not(Box::new(xyz.clone()))))
+            Some(("", Expression::Not(Box::new(xyz.clone()))))
         );
 
         // De Morgan's Law
-        assert_eq!(expression("~(~xyz&~1)"), Ok(("", de_morgan)));
+        assert_eq!(expression("~(~xyz&~1)"), Some(("", de_morgan)));
 
         // Test input
-        assert_eq!(expression("(Q&~P)|(P&~Q)"), Ok(("", test_input)));
+        assert_eq!(expression("(Q&~P)|(P&~Q)"), Some(("", test_input)));
 
         // invalid input?
-        assert!(expression("~~P").is_err());
-        assert!(expression("(A|B").is_err());
+        assert!(expression("~~P").is_none());
+        assert!(expression("(A|B").is_none());
     }
 }
